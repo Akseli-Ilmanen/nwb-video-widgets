@@ -6,6 +6,7 @@ import threading
 from functools import partial
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
+from unittest import result
 
 from pynwb import NWBFile
 from pynwb.image import ImageSeries
@@ -364,13 +365,16 @@ def _resolve_video_path(external_path: str, base_dir: Path | None) -> Path:
     return path
 
 
-def get_videos(nwbfile: NWBFile, session_time: float) -> dict[str, tuple[Path, float]]:
-    """Map a session timestamp to the corresponding video file and local time for each camera.
-
+def get_videos(nwbfile: NWBFile, session_time: float) -> dict[str, tuple[Path, float]]:       
+    """Map a session timestamp to the corresponding video file and local time for each camera.                                                                                                                                                                                                   
     For each ``ImageSeries`` with external video files in the NWB file,
     determines which video file contains the given session time and computes the
-    local time within that file.  Uses ``starting_frame`` to locate the correct
-    segment and ``rate`` for frame-to-time conversion.
+    local time within that file.
+
+    Supports two NWB timing schemes:
+    - **Rate mode**: ``rate`` + ``starting_time`` — evenly spaced frames.
+    - **Timestamps mode**: explicit ``timestamps`` array — one per frame,
+    supports gaps between files (e.g. per-trial videos).
 
     Parameters
     ----------
@@ -384,59 +388,82 @@ def get_videos(nwbfile: NWBFile, session_time: float) -> dict[str, tuple[Path, f
     Returns
     -------
     dict[str, tuple[Path, float]]
-        Mapping of camera name to ``(video_file_path, local_time_within_file)``.
-        Cameras where ``session_time`` falls outside the recorded range are
+        Mapping of acquisition name to ``(video_file_path, local_time_within_file)``.
+        Streams where ``session_time`` falls outside the recorded range are
         omitted from the result.
 
     Examples
     --------
     >>> result = get_videos(nwbfile, session_time=35.0)
     >>> result
-    {"cam1": (Path("cam1-video1.mp4"), 5.0), "cam2": (Path("cam2-video1.mp4"), 7.0)}
+    {"video_cam-1": (Path("cam1-video1.mp4"), 5.0)}
     """
     video_series = discover_video_series(nwbfile)
-
+    
     base_dir = None
     if nwbfile.read_io is not None and hasattr(nwbfile.read_io, "source"):
         base_dir = Path(nwbfile.read_io.source).parent
 
     result: dict[str, tuple[Path, float]] = {}
     for name, series in video_series.items():
-        rate = series.rate
-        if rate is None or rate <= 0:
-            continue
-
-        starting_time = float(series.starting_time) if series.starting_time is not None else 0.0
-        global_frame = (session_time - starting_time) * rate
-        if global_frame < 0:
-            continue
-
         files = list(series.external_file)
         starting_frames = (
-            [int(f) for f in series.starting_frame] if series.starting_frame is not None else [0] * len(files)
+            [int(f) for f in series.starting_frame]
+            if series.starting_frame is not None
+            else [0] * len(files)
         )
         if len(starting_frames) != len(files):
             continue
 
-        if global_frame < starting_frames[0]:
-            continue
+        rate = series.rate
+        timestamps = getattr(series, "timestamps", None)
 
-        for i in range(len(files)):
-            file_start = starting_frames[i]
-            if i + 1 < len(files):
-                file_end = float(starting_frames[i + 1])
-            else:
-                file_path = _resolve_video_path(files[i], base_dir)
-                if file_path.is_file():
-                    duration = _get_video_duration(file_path)
-                    file_end = file_start + duration * rate if duration is not None else float("inf")
+        if timestamps is not None and len(timestamps) > 0:
+            # Timestamps mode: searchsorted into the timestamps array
+            ts = np.asarray(timestamps)
+            if session_time < ts[0] or session_time > ts[-1]:
+                continue
+
+            global_idx = int(np.searchsorted(ts, session_time, side="right")) - 1
+            global_idx = max(0, min(global_idx, len(ts) - 1))
+
+            # Find which file this index belongs to
+            file_idx = np.searchsorted(starting_frames, global_idx, side="right") - 1
+            file_idx = max(0, min(file_idx, len(files) - 1))
+
+            local_idx = global_idx - starting_frames[file_idx]
+            # Local time = time elapsed since this file's first frame
+            file_first_ts = ts[starting_frames[file_idx]]
+            local_time = float(ts[global_idx]) - float(file_first_ts)
+
+            result[name] = (_resolve_video_path(files[file_idx], base_dir), local_time)
+
+        elif rate is not None and rate > 0:
+            # Rate mode: evenly spaced frames
+            starting_time = float(series.starting_time) if series.starting_time is not None else 0.0
+            global_frame = (session_time - starting_time) * rate
+            if global_frame < 0:
+                continue
+
+            if global_frame < starting_frames[0]:
+                continue
+
+            for i in range(len(files)):
+                file_start = starting_frames[i]
+                if i + 1 < len(files):
+                    file_end = float(starting_frames[i + 1])
                 else:
-                    file_end = float("inf")
+                    file_path = _resolve_video_path(files[i], base_dir)
+                    if file_path.is_file():
+                        duration = _get_video_duration(file_path)
+                        file_end = file_start + duration * rate if duration is not None else float("inf")
+                    else:
+                        file_end = float("inf")
 
-            if file_start <= global_frame < file_end:
-                local_time = (global_frame - file_start) / rate
-                result[name] = (_resolve_video_path(files[i], base_dir), local_time)
-                break
+                if file_start <= global_frame < file_end:
+                    local_time = (global_frame - file_start) / rate
+                    result[name] = (_resolve_video_path(files[i], base_dir), local_time)
+                    break
 
     return result
 
