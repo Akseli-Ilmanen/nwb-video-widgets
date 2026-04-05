@@ -284,6 +284,163 @@ def get_video_info(nwbfile: NWBFile) -> dict[str, dict]:
     return info
 
 
+def _get_mp4_duration_from_data(data: bytes) -> float | None:
+    """Extract movie duration in seconds from MP4/MOV data via the ``mvhd`` box."""
+    end = len(data)
+    moov = _find_mp4_box(data, 0, end, b"moov")
+
+    if moov is None:
+        search_pos = 0
+        while True:
+            found = data.find(b"moov", search_pos)
+            if found == -1 or found < 4:
+                return None
+            box_size = struct.unpack_from(">I", data, found - 4)[0]
+            if 16 < box_size <= end - (found - 4):
+                moov = (found + 4, found - 4 + box_size)
+                break
+            search_pos = found + 4
+
+    if moov is None:
+        return None
+
+    start, end = moov
+    mvhd = _find_mp4_box(data, start, end, b"mvhd")
+    if mvhd is None:
+        return None
+
+    start, end = mvhd
+    version = data[start]
+    if version == 1:
+        if start + 32 > end:
+            return None
+        timescale = struct.unpack_from(">I", data, start + 20)[0]
+        duration = struct.unpack_from(">Q", data, start + 24)[0]
+    else:
+        if start + 20 > end:
+            return None
+        timescale = struct.unpack_from(">I", data, start + 12)[0]
+        duration = struct.unpack_from(">I", data, start + 16)[0]
+
+    if timescale == 0:
+        return None
+    return duration / timescale
+
+
+def _get_video_duration(video_path: Path) -> float | None:
+    """Get duration of a video file in seconds by parsing MP4/MOV container metadata.
+
+    Returns ``None`` if the format is not recognized or the duration
+    cannot be determined.
+    """
+    file_size = video_path.stat().st_size
+    with open(video_path, "rb") as f:
+        data = f.read(_HEADER_READ_SIZE)
+
+    if len(data) < 12:
+        return None
+
+    if data[4:8] in (b"ftyp", b"moov"):
+        duration = _get_mp4_duration_from_data(data)
+        if duration is not None:
+            return duration
+        if file_size > _HEADER_READ_SIZE:
+            tail_size = min(file_size, _HEADER_READ_SIZE * 8)
+            with open(video_path, "rb") as f:
+                f.seek(file_size - tail_size)
+                tail_data = f.read(tail_size)
+            return _get_mp4_duration_from_data(tail_data)
+
+    return None
+
+
+def _resolve_video_path(external_path: str, base_dir: Path | None) -> Path:
+    """Resolve an external_file path to a Path, relative to the NWB file directory."""
+    path = Path(external_path)
+    if path.is_absolute():
+        return path
+    if base_dir is not None:
+        return (base_dir / path).resolve()
+    return path
+
+
+def get_videos(nwbfile: NWBFile, session_time: float) -> dict[str, tuple[Path, float]]:
+    """Map a session timestamp to the corresponding video file and local time for each camera.
+
+    For each ``ImageSeries`` with external video files in the NWB file,
+    determines which video file contains the given session time and computes the
+    local time within that file.  Uses ``starting_frame`` to locate the correct
+    segment and ``rate`` for frame-to-time conversion.
+
+    Parameters
+    ----------
+    nwbfile : NWBFile
+        An open NWBFile containing ImageSeries acquisitions with external video
+        files.  If loaded from disk the file paths are resolved relative to the
+        NWB file location; absolute ``external_file`` paths work regardless.
+    session_time : float
+        Time in seconds from session start.
+
+    Returns
+    -------
+    dict[str, tuple[Path, float]]
+        Mapping of camera name to ``(video_file_path, local_time_within_file)``.
+        Cameras where ``session_time`` falls outside the recorded range are
+        omitted from the result.
+
+    Examples
+    --------
+    >>> result = get_videos(nwbfile, session_time=35.0)
+    >>> result
+    {"cam1": (Path("cam1-video1.mp4"), 5.0), "cam2": (Path("cam2-video1.mp4"), 7.0)}
+    """
+    video_series = discover_video_series(nwbfile)
+
+    base_dir = None
+    if nwbfile.read_io is not None and hasattr(nwbfile.read_io, "source"):
+        base_dir = Path(nwbfile.read_io.source).parent
+
+    result: dict[str, tuple[Path, float]] = {}
+    for name, series in video_series.items():
+        rate = series.rate
+        if rate is None or rate <= 0:
+            continue
+
+        starting_time = float(series.starting_time) if series.starting_time is not None else 0.0
+        global_frame = (session_time - starting_time) * rate
+        if global_frame < 0:
+            continue
+
+        files = list(series.external_file)
+        starting_frames = (
+            [int(f) for f in series.starting_frame] if series.starting_frame is not None else [0] * len(files)
+        )
+        if len(starting_frames) != len(files):
+            continue
+
+        if global_frame < starting_frames[0]:
+            continue
+
+        for i in range(len(files)):
+            file_start = starting_frames[i]
+            if i + 1 < len(files):
+                file_end = float(starting_frames[i + 1])
+            else:
+                file_path = _resolve_video_path(files[i], base_dir)
+                if file_path.is_file():
+                    duration = _get_video_duration(file_path)
+                    file_end = file_start + duration * rate if duration is not None else float("inf")
+                else:
+                    file_end = float("inf")
+
+            if file_start <= global_frame < file_end:
+                local_time = (global_frame - file_start) / rate
+                result[name] = (_resolve_video_path(files[i], base_dir), local_time)
+                break
+
+    return result
+
+
 class _RangeRequestHandler(SimpleHTTPRequestHandler):
     """HTTP request handler with CORS headers and Range request support for video streaming."""
 
