@@ -7,6 +7,7 @@ from functools import partial
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from unittest import result
+import numpy as np
 
 from pynwb import NWBFile
 from pynwb.image import ImageSeries
